@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+sentence-transformers
+transformers
+torch
+newspaper3k
+lxml[html_clean]
+openai

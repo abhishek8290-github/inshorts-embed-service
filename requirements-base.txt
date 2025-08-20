@@ -1,0 +1,5 @@
+fastapi
+uvicorn
+openai
+newspaper3k
+lxml[html_clean]
