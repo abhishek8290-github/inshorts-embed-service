@@ -6,6 +6,11 @@ import openai
 import os
 from typing import Optional
 import requests
+from playwright.sync_api import sync_playwright
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="News Summarizer & Video Finder API", version="1.0.0")
 
@@ -26,24 +31,6 @@ class Query(BaseModel):
 class URLQuery(BaseModel):
     url: str
 
-class VideoMetadata(BaseModel):
-    id: str
-    title: str
-    description: str
-    url: str
-    publication_date: str
-    source_name: str
-    category: list
-    relevance_score: float
-    latitude: Optional[float] = None
-    longitude: Optional[float] = None
-    vector_embedding: list = []
-    llm_summary: str = ""
-
-class VideoResponse(BaseModel):
-    video_url: str
-    status: str
-    metadata: dict
 
 # Routes
 @app.get("/")
@@ -60,6 +47,10 @@ def embed_text(query: Query):
 
 @app.post("/summarize")
 def summarize_url(query: URLQuery):
+    article_text = ""
+    article_title = ""
+
+    # Try with newspaper3k first
     try:
         article = Article(
             query.url, 
@@ -69,16 +60,41 @@ def summarize_url(query: URLQuery):
         )
         article.download()
         article.parse()
-        
-        if not article.text:
-            raise HTTPException(status_code=400, detail="Could not extract article content")
+        article_text = article.text
+        article_title = article.title
+        if not article_text:
+            logger.warning(f"Newspaper3k failed to extract content from {query.url}. Trying with Playwright.")
+            raise ValueError("Newspaper3k failed") # Force fallback
+    except Exception as e:
+        logger.error(f"Newspaper3k download/parse failed: {e}")
+        # Fallback to Playwright
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True)
+                page = browser.new_page()
+                page.goto(query.url, wait_until="domcontentloaded")
+                article_html = page.content()
+                browser.close()
 
+                article = Article(query.url)
+                article.set_html(article_html)
+                article.parse()
+                article_text = article.text
+                article_title = article.title
+                if not article_text:
+                    raise HTTPException(status_code=400, detail="Could not extract article content with Playwright")
+                logger.info(f"Successfully extracted content with Playwright from {query.url}")
+        except Exception as playwright_e:
+            logger.error(f"Playwright failed to extract content from {query.url}: {playwright_e}")
+            raise HTTPException(status_code=500, detail=f"Failed to extract article content from URL: {playwright_e}")
+
+    try:
         # Use OpenAI for summarization
         response = client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[
                 {"role": "system", "content": "You are a helpful assistant that summarizes news articles."},
-                {"role": "user", "content": f"Summarize the following article: {article.text}"}
+                {"role": "user", "content": f"Summarize the following article: {article_text}"}
             ],
             max_tokens=150
         )
@@ -86,45 +102,14 @@ def summarize_url(query: URLQuery):
         summary = response.choices[0].message.content
         return {
             "summary": summary, 
-            "title": article.title,
+            "title": article_title,
             "status": "success"
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Summarization failed: {str(e)}")
 
-@app.post("/find-video", response_model=VideoResponse)
-def find_video_endpoint(metadata: VideoMetadata):
-    """
-    Find the exact YouTube video URL based on metadata
-    """
-    try:
-        video_url = find_exact_video(metadata.dict())
-        
-        if video_url == "NOT_FOUND":
-            return VideoResponse(
-                video_url="",
-                status="not_found",
-                metadata={
-                    "original_title": metadata.title,
-                    "search_date": metadata.publication_date,
-                    "message": "Video not found with the provided criteria"
-                }
-            )
-        
-        return VideoResponse(
-            video_url=video_url,
-            status="found",
-            metadata={
-                "original_title": metadata.title,
-                "search_date": metadata.publication_date,
-                "channel": "NDTV Profit India"
-            }
-        )
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Video search failed: {str(e)}")
 
-# Helper Functions
+
 def llm_with_search(prompt: str) -> str:
     """
     LLM with web search capability using OpenAI
@@ -150,81 +135,6 @@ def llm_with_search(prompt: str) -> str:
     except Exception as e:
         return f"Search failed: {str(e)}"
 
-def find_exact_video(metadata: dict) -> str:
-    """
-    Find exact YouTube video using LLM with search
-    """
-    prompt = f"""
-    Find the exact YouTube video URL for:
-    
-    Title: "{metadata['title']}"
-    Channel: NDTV Profit India
-    Published: {metadata['publication_date'][:10]}
-    
-    Search YouTube and return ONLY the direct video URL in this format:
-    https://www.youtube.com/watch?v=VIDEO_ID
-    
-    Requirements:
-    - Must be from NDTV Profit channel
-    - Must match the exact title
-    - Must be published around the given date
-    
-    If not found, return: NOT_FOUND
-    """
-    
-    response = llm_with_search(prompt)
-    return response.strip()
-
-# Alternative endpoint with Perplexity AI (recommended)
-@app.post("/find-video-perplexity")
-def find_video_with_perplexity(metadata: VideoMetadata):
-    """
-    Find video using Perplexity AI (requires PERPLEXITY_API_KEY)
-    """
-    perplexity_key = os.getenv("PERPLEXITY_API_KEY")
-    if not perplexity_key:
-        raise HTTPException(status_code=400, detail="PERPLEXITY_API_KEY not configured")
-    
-    try:
-        prompt = f"""
-        Find the exact YouTube video URL for:
-        Title: "{metadata.title}"
-        Channel: NDTV Profit India
-        Published: {metadata.publication_date[:10]}
-        
-        Return ONLY the YouTube URL in format: https://www.youtube.com/watch?v=VIDEO_ID
-        If not found, return: NOT_FOUND
-        """
-        
-        headers = {
-            "Authorization": f"Bearer {perplexity_key}",
-            "Content-Type": "application/json"
-        }
-        
-        data = {
-            "model": "llama-3.1-sonar-small-128k-online",
-            "messages": [{"role": "user", "content": prompt}]
-        }
-        
-        response = requests.post(
-            "https://api.perplexity.ai/chat/completions",
-            headers=headers,
-            json=data,
-            timeout=30
-        )
-        
-        if response.status_code == 200:
-            result = response.json()["choices"][0]["message"]["content"].strip()
-            return {
-                "video_url": result,
-                "status": "found" if result != "NOT_FOUND" else "not_found",
-                "service": "perplexity"
-            }
-        else:
-            raise HTTPException(status_code=500, detail="Perplexity API error")
-            
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Perplexity search failed: {str(e)}")
 
 # Health check
 @app.get("/health")
@@ -232,9 +142,8 @@ def health_check():
     return {
         "status": "healthy",
         "openai_configured": bool(os.getenv("OPENAI_API_KEY")),
-        "perplexity_configured": bool(os.getenv("PERPLEXITY_API_KEY"))
     }
 
-# if __name__ == "__main__":
-#     import uvicorn
-#     uvicorn.run(app, host="0.0.0.0", port=8000)
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
